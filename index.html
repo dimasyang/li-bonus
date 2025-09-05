@@ -3,9 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>李采紋績效獎金紀錄試算表（RWD）</title>
+  <title>李采紋績效獎金紀錄試算表（RWD, 日期區間＋強化匯出）</title>
+  <!-- Firebase compat -->
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+  <!-- SheetJS -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <style>
     :root{
@@ -26,7 +28,7 @@
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans CJK TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
       background:var(--bg); color:var(--text);
     }
-    .container{ max-width:1000px; margin:0 auto; padding: max(env(safe-area-inset-top), 16px) 16px calc(84px + env(safe-area-inset-bottom)); }
+    .container{ max-width:1000px; margin:0 auto; padding: max(env(safe-area-inset-top), 16px) 16px calc(100px + env(safe-area-inset-bottom)); }
     h1{ font-size: clamp(20px, 3.5vw, 28px); margin:0 0 12px; color:#006080; }
     .rules{ background:#e8f8f5; padding:10px; border-left:4px solid #00aaaa; border-radius:8px; }
     .card{ background:var(--card); border:1px solid var(--bd); border-radius:var(--radius); padding:16px; margin-top:12px; }
@@ -34,7 +36,7 @@
     @media (min-width: 640px){ .grid{ grid-template-columns: repeat(2, 1fr); } }
     @media (min-width: 960px){ .grid{ grid-template-columns: repeat(4, 1fr); } }
     label span{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
-    input, button{
+    input, button, select{
       width:100%; padding:10px; border-radius:8px; border:1px solid var(--bd);
       background:#fff; color:var(--text);
     }
@@ -61,6 +63,9 @@
       padding:10px 12px; display:grid; grid-template-columns: 1fr 1fr; gap:10px;
     }
     @media (min-width: 640px){ .dock{ grid-template-columns: repeat(4, 1fr); } }
+    .filters{ display:grid; gap:10px; grid-template-columns: 1fr 1fr; }
+    @media (min-width: 640px){ .filters{ grid-template-columns: repeat(5, 1fr); } }
+    .muted{ color:#666; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -76,7 +81,7 @@
       <li>退貨率 < 3%：額外獎金 $300</li>
     </ul>
 
-    <!-- 表單 -->
+    <!-- 新增/編輯 表單 -->
     <section class="card">
       <div class="grid">
         <label><span>日期</span><input type="date" id="dateInput" /></label>
@@ -87,10 +92,30 @@
       <div class="actions">
         <button class="btn primary" id="btnSave">儲存記錄</button>
         <button class="btn" id="btnDelete">刪除選取</button>
-        <button class="btn ok" id="btnExport">匯出 Excel</button>
+        <button class="btn ok" id="btnExport">匯出（篩選結果）</button>
         <button class="btn" id="btnRefresh">重新整理</button>
       </div>
       <div id="summary" class="summary"></div>
+    </section>
+
+    <!-- 篩選區（日期區間） -->
+    <section class="card">
+      <div class="filters">
+        <label><span>起始日期</span><input type="date" id="fromDate" /></label>
+        <label><span>結束日期</span><input type="date" id="toDate" /></label>
+        <div><span class="muted">快速區間</span>
+          <select id="quickRange">
+            <option value="thisMonth">本月</option>
+            <option value="lastMonth">上月</option>
+            <option value="thisQuarter">本季</option>
+            <option value="thisYear">今年</option>
+            <option value="all">全部</option>
+          </select>
+        </div>
+        <button class="btn" id="btnFilter">套用篩選</button>
+        <button class="btn danger" id="btnClear">清除篩選</button>
+      </div>
+      <div class="muted">＊匯出功能會輸出「篩選後」的資料與統計。</div>
     </section>
 
     <!-- 表格 -->
@@ -119,7 +144,7 @@
   <nav class="dock">
     <button class="btn primary" id="dockSave">儲存</button>
     <button class="btn" id="dockRefresh">重新整理</button>
-    <button class="btn" id="dockExport">匯出 Excel</button>
+    <button class="btn" id="dockExport">匯出（篩選）</button>
     <button class="btn danger" id="dockDelete">刪除選取</button>
   </nav>
 
@@ -137,17 +162,25 @@
     firebase.initializeApp(firebaseConfig);
     const db = firebase.firestore();
 
+    // Helpers
     const $ = (s)=>document.querySelector(s);
     const pad = (n)=> String(n).padStart(2,'0');
-    const today = new Date();
-    $("#dateInput").value = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+    const fmtDate = (d)=> `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 
-    // ——— 事件綁定 ———
+    const today = new Date();
+    $("#dateInput").value = fmtDate(today);
+
+    // 全域狀態
+    let allRecords = [];    // 來自 Firestore 的完整資料
+    let filtered = [];      // 目前篩選後的資料
+    let unsubscribe = null; // 監聽
+
+    // 綁定事件
     function bind(){
       const onSave = ()=>saveRecord();
       const onRefresh = ()=>loadDataOnce();
       const onDelete = ()=>deleteSelected();
-      const onExport = ()=>exportExcel();
+      const onExport = ()=>exportFiltered();
 
       $("#btnSave").addEventListener("click", onSave);
       $("#btnRefresh").addEventListener("click", onRefresh);
@@ -162,9 +195,41 @@
       $("#selectAll").addEventListener("change", (e)=>{
         document.querySelectorAll('input[type="checkbox"].row-check').forEach(cb => cb.checked = e.target.checked);
       });
+
+      // 篩選區
+      $("#btnFilter").addEventListener("click", applyFilter);
+      $("#btnClear").addEventListener("click", clearFilter);
+      $("#quickRange").addEventListener("change", setQuickRange);
     }
 
-    // ——— 新增資料 ———
+    // 快速區間
+    function setQuickRange(){
+      const v = $("#quickRange").value;
+      const now = new Date();
+      let start = null, end = null;
+
+      if(v === "thisMonth"){
+        start = new Date(now.getFullYear(), now.getMonth(), 1);
+        end   = new Date(now.getFullYear(), now.getMonth()+1, 0);
+      }else if(v === "lastMonth"){
+        const m = new Date(now.getFullYear(), now.getMonth()-1, 1);
+        start = m;
+        end   = new Date(m.getFullYear(), m.getMonth()+1, 0);
+      }else if(v === "thisQuarter"){
+        const q = Math.floor(now.getMonth()/3);
+        start = new Date(now.getFullYear(), q*3, 1);
+        end   = new Date(now.getFullYear(), q*3+3, 0);
+      }else if(v === "thisYear"){
+        start = new Date(now.getFullYear(), 0, 1);
+        end   = new Date(now.getFullYear(), 11, 31);
+      }else if(v === "all"){
+        start = null; end = null;
+      }
+      $("#fromDate").value = start ? fmtDate(start) : "";
+      $("#toDate").value   = end   ? fmtDate(end)   : "";
+    }
+
+    // 新增資料
     async function saveRecord() {
       try{
         const date = $("#dateInput").value;
@@ -174,10 +239,14 @@
         if (!date) return alert("請輸入日期");
         await db.collection("records").add({ date, pickup, deliveries, returns, createdAt: new Date() });
         alert("✅ 已儲存");
+        // 清空輸入（保留日期）
+        $("#pickupInput").value = "";
+        $("#deliveriesInput").value = "";
+        $("#returnsInput").value = "";
       }catch(err){ alert("❌ 新增錯誤："+ err.message); }
     }
 
-    // ——— 刪除選取 ———
+    // 刪除
     async function deleteSelected() {
       try{
         const checked = document.querySelectorAll('input.row-check:checked');
@@ -192,27 +261,46 @@
       }catch(err){ alert("❌ 刪除錯誤："+ err.message); }
     }
 
-    // ——— 匯出 Excel ———
-    function exportExcel() {
-      const table = document.getElementById("recordTable");
-      const wb = XLSX.utils.table_to_book(table, { sheet: "Sheet1" });
-      XLSX.writeFile(wb, "bonus_records.xlsx");
+    // 匯出（使用資料陣列，不依賴 DOM 表格，避免外掛或樣式干擾）
+    function exportFiltered() {
+      try{
+        const rows = [["日期","自取金額","出貨件數","退貨件數"]];
+        let totalPickup = 0, totalDeliveries = 0, totalReturns = 0;
+        filtered.forEach(r => {
+          rows.push([r.date, Number(r.pickup)||0, Number(r.deliveries)||0, Number(r.returns)||0]);
+          totalPickup += Number(r.pickup)||0;
+          totalDeliveries += Number(r.deliveries)||0;
+          totalReturns += Number(r.returns)||0;
+        });
+        rows.push([]);
+        rows.push(["合計", totalPickup, totalDeliveries, totalReturns]);
+
+        if(typeof XLSX !== "undefined" && XLSX.utils){
+          const wb = XLSX.utils.book_new();
+          const ws = XLSX.utils.aoa_to_sheet(rows);
+          XLSX.utils.book_append_sheet(wb, ws, "Records");
+          XLSX.writeFile(wb, "bonus_records_filtered.xlsx");
+        }else{
+          // 簡易 CSV 後備
+          const csv = rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
+          const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "bonus_records_filtered.csv";
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+      }catch(err){
+        alert("❌ 匯出失敗：" + err.message + "\n若持續發生，請告知我錯誤畫面。");
+      }
     }
 
-    // ——— 更新摘要（當月） ———
-    function updateSummary(records) {
-      const now = new Date();
-      const currentYear = now.getFullYear();
-      const currentMonth = now.getMonth();
-
-      const currentMonthRecords = records.filter(r => {
-        const d = new Date(r.date);
-        return d.getFullYear() === currentYear && d.getMonth() === currentMonth;
-      });
-
-      const total = currentMonthRecords.reduce((sum, r) => sum + (Number(r.pickup)||0), 0);
-      const totalDeliveries = currentMonthRecords.reduce((sum, r) => sum + (Number(r.deliveries)||0), 0);
-      const totalReturns = currentMonthRecords.reduce((sum, r) => sum + (Number(r.returns)||0), 0);
+    // 摘要（基於目前 filtered）
+    function updateSummary() {
+      const total = filtered.reduce((sum, r) => sum + (Number(r.pickup)||0), 0);
+      const totalDeliveries = filtered.reduce((sum, r) => sum + (Number(r.deliveries)||0), 0);
+      const totalReturns = filtered.reduce((sum, r) => sum + (Number(r.returns)||0), 0);
       const returnRate = totalDeliveries > 0 ? (totalReturns / totalDeliveries) : 0;
 
       let bonus = 0;
@@ -227,53 +315,73 @@
         else if (returnRate < 0.03) bonus += 300;
       }
 
-      $("#summary").innerText = `本月自取總額: $${Math.round(total).toLocaleString()} ｜ 退貨率: ${(returnRate * 100).toFixed(2)}% ｜ 預估獎金: $${Math.round(bonus).toLocaleString()}`;
+      $("#summary").innerText = `區間自取總額: $${Math.round(total).toLocaleString()} ｜ 退貨率: ${(returnRate * 100).toFixed(2)}% ｜ 預估獎金: $${Math.round(bonus).toLocaleString()}（基於下方篩選結果）`;
     }
 
-    // ——— 渲染表格（只顯示當月） ———
-    function renderTable(records) {
-      const now = new Date();
-      const currentMonth = now.getMonth();
-      const currentYear = now.getFullYear();
+    // 渲染（套用篩選）
+    function renderTable() {
       const tbody = $("#recordBody");
       tbody.innerHTML = "";
-      records.forEach(r => {
-        const d = new Date(r.date);
-        if (d.getFullYear() === currentYear && d.getMonth() === currentMonth) {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `
-            <td><input type="checkbox" class="row-check" data-id="${r.id}"></td>
-            <td>${r.date}</td>
-            <td>${r.pickup}</td>
-            <td>${r.deliveries}</td>
-            <td>${r.returns}</td>
-          `;
-          tbody.appendChild(tr);
-        }
+      filtered.forEach(r => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" class="row-check" data-id="${r.id}"></td>
+          <td>${r.date}</td>
+          <td>${r.pickup}</td>
+          <td>${r.deliveries}</td>
+          <td>${r.returns}</td>
+        `;
+        tbody.appendChild(tr);
       });
+      updateSummary();
     }
 
-    // ——— 即時監聽（依 date 排序） ———
-    let unsubscribe = null;
+    // 篩選邏輯（inclusive）
+    function applyFilter(){
+      const from = $("#fromDate").value ? new Date($("#fromDate").value) : null;
+      const to   = $("#toDate").value   ? new Date($("#toDate").value)   : null;
+      filtered = allRecords.filter(r => {
+        const d = new Date(r.date);
+        if (from && d < new Date(from.getFullYear(), from.getMonth(), from.getDate())) return false;
+        if (to && d > new Date(to.getFullYear(), to.getMonth(), to.getDate(), 23,59,59,999)) return false;
+        return true;
+      });
+      renderTable();
+      $("#selectAll").checked = false;
+    }
+
+    function clearFilter(){
+      $("#fromDate").value = "";
+      $("#toDate").value = "";
+      filtered = [...allRecords];
+      renderTable();
+      $("#selectAll").checked = false;
+      $("#quickRange").value = "thisMonth";
+    }
+
+    // 監聽 Firestore（依 date 排序）
     function listenRealtime() {
       if (unsubscribe) unsubscribe();
       unsubscribe = db.collection("records").orderBy("date","desc").onSnapshot(snap => {
-        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        renderTable(data);
-        updateSummary(data);
+        allRecords = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        // 初始預設：本月
+        if(!$("#fromDate").value && !$("#toDate").value){
+          setQuickRange(); // 本月
+        }
+        applyFilter();
       }, err => {
-        alert("❌ 讀取錯誤："+ err.message + "\\n\\n可能原因：1) 防火牆阻擋 2) Firestore 規則限制 3) 欄位型態不一致");
+        alert("❌ 讀取錯誤："+ err.message + "\n\n可能原因：1) 防火牆阻擋 2) Firestore 規則限制 3) 欄位型態不一致");
       });
     }
 
-    // ——— 備用：手動載入一次 ———
+    // 備用：手動載入一次
     async function loadDataOnce(){
       const snap = await db.collection("records").orderBy("date","desc").get();
-      const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      renderTable(data);
-      updateSummary(data);
+      allRecords = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      applyFilter();
     }
 
+    // 初始化
     bind();
     listenRealtime();
   </script>
